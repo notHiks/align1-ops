@@ -1,0 +1,65 @@
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: k8s-gateway
+spec:
+  chartRef:
+    kind: OCIRepository
+    name: k8s-gateway
+  interval: 1h
+  # Cilium serves the LoadBalancer IP itself; NodePorts would only open DNS on
+  # every node address, so they are dropped unless the class forwards to
+  # them. Patched as the chart has no value for it, and so
+  # loadBalancerClass always renders as a string.
+  postRenderers:
+    - kustomize:
+        patches:
+          - target:
+              kind: Service
+              name: k8s-gateway
+            patch: |
+              #% if not gateways.dns.node_ports %#
+              - op: add
+                path: /spec/allocateLoadBalancerNodePorts
+                value: false
+              #% endif %#
+              #% if gateways.dns.load_balancer_class %#
+              - op: add
+                path: /spec/loadBalancerClass
+                value: "#{ gateways.dns.load_balancer_class }#"
+              #% endif %#
+  values:
+    fullnameOverride: k8s-gateway
+    serviceType: LoadBalancer
+    service:
+      #% if gateways.dns.address %#
+      annotations:
+        lbipam.cilium.io/ips: "#{ gateways.dns.address }#"
+      #% endif %#
+      externalTrafficPolicy: Cluster
+    servers:
+      - zones:
+          - zone: .
+            scheme: dns://
+            use_tcp: true
+        port: 53
+        plugins:
+          - name: errors
+          - name: health
+            configBlock: |-
+              lameduck 5s
+          - name: ready
+          - name: k8s_gateway
+            parameters: "${SECRET_DOMAIN}"
+            configBlock: |-
+              apex k8s-gateway.network
+              ttl 1
+              resources Service HTTPRoute
+          - name: forward
+            parameters: . /etc/resolv.conf
+          - name: loop
+          - name: reload
+          - name: loadbalance
+          - name: prometheus
+            parameters: 0.0.0.0:9153

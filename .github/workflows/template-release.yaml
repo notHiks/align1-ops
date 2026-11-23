@@ -1,0 +1,31 @@
+---
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+name: "Release"
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: 0 0 1 * *
+
+permissions: {}
+
+jobs:
+  release:
+    if: ${{ github.repository == 'onedr0p/cluster-template' }}
+    name: Release
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write
+    steps:
+      - name: Create Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          previous="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 1 --json tagName --jq '.[0].tagName // "0.0.0"')"
+          month="$(date --utc +%Y.%-m)"
+          if [[ "${previous%.*}" == "$month" ]]; then
+              patch=$((${previous##*.} + 1))
+          else
+              patch=0
+          fi
+          gh release create "$month.$patch" --repo "$GITHUB_REPOSITORY" --generate-notes

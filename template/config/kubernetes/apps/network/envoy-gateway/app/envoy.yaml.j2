@@ -1,0 +1,178 @@
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata:
+  name: envoy
+spec:
+  logging:
+    level:
+      default: info
+  provider:
+    type: Kubernetes
+    kubernetes:
+      envoyDeployment:
+        replicas: #{ 2 if nodes | length > 1 else 1 }#
+        container:
+          imageRepository: mirror.gcr.io/envoyproxy/envoy
+          resources:
+            requests:
+              cpu: 100m
+            limits:
+              memory: 1Gi
+      envoyService:
+        # Cilium serves the LoadBalancer IP itself; NodePorts would only open
+        # the gateways on every node address. Gateways whose class forwards
+        # to NodePorts turn them back on below.
+        allocateLoadBalancerNodePorts: false
+        externalTrafficPolicy: Cluster
+  shutdown:
+    drainTimeout: 180s
+  telemetry:
+    metrics:
+      prometheus:
+        compression:
+          type: Zstd
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: envoy
+spec:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller
+  parametersRef:
+    group: gateway.envoyproxy.io
+    kind: EnvoyProxy
+    name: envoy
+    namespace: network
+#% for name in (['external'] if ingress.mode != 'none' else []) + ['internal'] %#
+#% set gateway = gateways[name] %#
+#% if gateway.load_balancer_class %#
+---
+# Merged onto the GatewayClass EnvoyProxy to set the Service's
+# loadBalancerClass for this gateway only.
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata:
+  name: envoy-#{ name }#
+spec:
+  mergeType: StrategicMerge
+  provider:
+    type: Kubernetes
+    kubernetes:
+      envoyService:
+        loadBalancerClass: "#{ gateway.load_balancer_class }#"
+        #% if gateway.node_ports %#
+        allocateLoadBalancerNodePorts: true
+        #% endif %#
+#% endif %#
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: envoy-#{ name }#
+  annotations:
+    external-dns.kubernetes.io/target: #{ name }#.${SECRET_DOMAIN}
+spec:
+  gatewayClassName: envoy
+  infrastructure:
+    annotations:
+      external-dns.kubernetes.io/hostname: #{ name }#.${SECRET_DOMAIN}
+      #% if gateway.address %#
+      lbipam.cilium.io/ips: "#{ gateway.address }#"
+      #% endif %#
+    #% if gateway.load_balancer_class %#
+    parametersRef:
+      group: gateway.envoyproxy.io
+      kind: EnvoyProxy
+      name: envoy-#{ name }#
+    #% endif %#
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+      allowedRoutes:
+        namespaces:
+          from: Same
+    - name: https
+      protocol: HTTPS
+      port: 443
+      allowedRoutes:
+        namespaces:
+          from: All
+      tls:
+        certificateRefs:
+          - kind: Secret
+            name: ${SECRET_DOMAIN/./-}-production-tls
+#% endfor %#
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: BackendTrafficPolicy
+metadata:
+  name: envoy
+spec:
+  compressor:
+    - type: Zstd
+      zstd: {}
+    - type: Brotli
+      brotli: {}
+    - type: Gzip
+      gzip: {}
+  retry:
+    numRetries: 2
+    retryOn:
+      triggers:
+        - connect-failure
+        - refused-stream
+        - reset-before-request
+  targetSelectors:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+  tcpKeepalive: {}
+  timeout:
+    http:
+      requestTimeout: 0s
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: ClientTrafficPolicy
+metadata:
+  name: envoy
+spec:
+  clientIPDetection:
+    xForwardedFor:
+      trustedCIDRs:
+        - "#{ kubernetes.pod_cidr }#"
+  http2:
+    onInvalidMessage: TerminateStream
+  http3: {}
+  targetSelectors:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+  tcpKeepalive: {}
+  tls:
+    minVersion: "1.2"
+    alpnProtocols:
+      - h2
+      - http/1.1
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: https-redirect
+  annotations:
+    external-dns.kubernetes.io/controller: none
+spec:
+  parentRefs:
+    #% if ingress.mode != 'none' %#
+    - name: envoy-external
+      namespace: network
+      sectionName: http
+    #% endif %#
+    - name: envoy-internal
+      namespace: network
+      sectionName: http
+  rules:
+    - filters:
+        - type: RequestRedirect
+          requestRedirect:
+            scheme: https
+            statusCode: 301
